@@ -1,0 +1,38 @@
+[project]
+name = "mcp-server-osascript"
+version = "0.1.0"
+description = "Secure AppleScript execution for AI via Model Context Protocol"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "fastmcp>=0.1.0",
+]
+authors = [
+    {name = "MCP osascript Team"},
+]
+keywords = ["mcp", "applescript", "macos", "automation", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.scripts]
+mcp-server-osascript = "mcp_server_osascript.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.urls]
+Homepage = "https://github.com/your-username/mcp-server-osascript"
+Repository = "https://github.com/your-username/mcp-server-osascript"
+Issues = "https://github.com/your-username/mcp-server-osascript/issues"
