@@ -1,5 +1,7 @@
 # MCP osascript 服务器
 
+[🇺🇸 English](README.md)
+
 通过模型上下文协议（Model Context Protocol）为AI提供安全的AppleScript执行能力。
 
 ## 安装
