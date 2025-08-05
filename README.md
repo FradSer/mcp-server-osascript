@@ -1,52 +1,61 @@
 # MCP osascript Server
 
-[🇨🇳 中文版](README_CN.md)
+[中文版](README_CN.md)
 
-Secure AppleScript execution for AI via Model Context Protocol.
+Secure AppleScript execution for AI applications via Model Context Protocol with configurable security profiles and automatic TCC permission handling.
+
+## Overview
+
+This MCP server provides a bridge between AI models and macOS automation through secure AppleScript execution. It features a modular architecture with configurable security profiles, automatic permission management, and comprehensive error handling.
 
 ## Installation
 
-### For Development
+### Development Setup
 ```bash
+# Clone and setup dependencies
 uv sync
+
+# Optional: Development mode installation
+uv pip install -e .
 ```
 
-### For Production Use
+### Production Installation
 ```bash
-# Install directly from local directory
+# System-wide installation with uvx
 uvx install /path/to/mcp-server-osascript
 
-# Or install from Git repository
+# From Git repository
 uvx install git+https://github.com/your-username/mcp-server-osascript.git
 
-# Or install from PyPI (when published)
+# From PyPI (when published)
 uvx install mcp-server-osascript
 ```
 
 ## Usage
 
-### After uvx installation
+### Production Usage
 ```bash
-# Run the server directly (available system-wide)
+# After uvx installation (available system-wide)
 mcp-server-osascript
 ```
 
-### Development mode (from project directory)
+### Development Usage
 ```bash
-# Run from project directory
+# From project directory
 uv run mcp-server-osascript
 
-# Run from any directory
+# From any directory
 uv run --project /path/to/mcp-server-osascript mcp-server-osascript
 
-# Alternative: Python module
+# Alternative: Direct module execution
 uv run python -m mcp_server_osascript.server
 ```
 
 ## MCP Client Configuration
 
-To use this server with an MCP client, add the following configuration:
+Add this configuration to your MCP client:
 
+**Production Configuration:**
 ```json
 {
   "mcpServers": {
@@ -58,7 +67,7 @@ To use this server with an MCP client, add the following configuration:
 }
 ```
 
-Or for development:
+**Development Configuration:**
 ```json
 {
   "mcpServers": {
@@ -70,52 +79,120 @@ Or for development:
 }
 ```
 
+## Architecture
+
+The server is built with a modular architecture consisting of six focused components:
+
+- **Security System**: Configurable risk assessment with three security profiles
+- **Execution Engine**: Direct osascript execution with timeout management
+- **Permission Handler**: Automatic TCC permission dialog triggering
+- **Response Builder**: Standardized API response formatting
+- **User Interface**: Interactive confirmation dialogs
+- **Server Core**: FastMCP integration and tool registration
+
 ## Features
 
-- Secure AppleScript execution with security checks
-- Multiple security layers including script linting
-- TCC permission handling with helpful guidance
-- MCP protocol support for AI integration
-- Single focused tool: `execute_osascript`
+### Configurable Security Profiles
+- **Strict**: Maximum security with blocked dangerous operations
+- **Balanced**: Recommended default with risk warnings (default)
+- **Permissive**: Minimal restrictions with audit logging
+
+### Advanced Permission Management
+- Automatic TCC permission dialog triggering
+- Intelligent error parsing and user guidance
+- Support for common macOS applications
+- Manual permission configuration instructions
+
+### Comprehensive Tool Interface
+- Single unified `execute_osascript` tool
+- Dry-run mode for script analysis without execution
+- Configurable execution timeouts
+- Detailed success and error reporting
+
+## Tool Reference
+
+### `execute_osascript`
+
+Execute or analyze AppleScript/JavaScript code with comprehensive security and permission handling.
+
+**Parameters:**
+- `script` (str): AppleScript or JavaScript code to execute
+- `execution_timeout` (int): Timeout in seconds (default: 30)
+- `security_profile` (str): Security level - "strict", "balanced", or "permissive" (default: "balanced")
+- `enable_auto_permissions` (bool): Auto-trigger TCC permission dialogs (default: true)
+- `dry_run` (bool): Analyze script without executing (default: false)
+
+**Response Structure:**
+```json
+{
+  "status": "success|error",
+  "timestamp": "2024-01-01T12:00:00.000Z",
+  "data": {
+    "stdout": "execution output",
+    "stderr": "error output",
+    "execution_time": 1.23
+  }
+}
+```
+
+**Error Response:**
+```json
+{
+  "status": "error",
+  "timestamp": "2024-01-01T12:00:00.000Z",
+  "error": {
+    "type": "SECURITY_BLOCKED|TCC_PERMISSION_DENIED|EXECUTION_TIMEOUT|SYNTAX_ERROR",
+    "message": "Human-readable error description",
+    "details": "Additional error context and repair suggestions"
+  }
+}
+```
 
 ## Security Features
 
-### Script Security Checks
-- Blocks dangerous operation patterns (shell script execution, file deletion, etc.)
-- Identifies high-risk operations (keyboard/mouse control, system events, etc.)
-- High-risk operations require user confirmation
+### Script Analysis
+- Pattern matching for dangerous operations
+- Risk scoring and classification
+- High-risk operation confirmation prompts
+- Comprehensive audit logging
 
-### TCC Permission Handling
-- Intelligent recognition of macOS TCC permission errors
-- Provides detailed permission configuration guidance
-- Supports common application permission settings
+### Permission Management
+- TCC error code detection (-1743)
+- Application-specific permission guidance
+- Automatic permission dialog triggering
+- Manual configuration instructions
 
-### Execution Environment
-- Direct execution to ensure TCC permission dialogs display properly
-- Configurable execution timeout
-- Detailed error messages and repair suggestions
-
-## Tool Description
-
-### `execute_osascript`
-Core tool for safely executing AppleScript code.
-
-**Parameters:**
-- `script` (str): The AppleScript code to execute
-- `timeout` (int): Execution timeout in seconds, default 20
-
-**Return Values:**
-- `status`: Execution status ("success" or "error")
-- `stdout`: Standard output (on success)
-- `stderr`: Standard error (on success)
-- `type`: Error type (on error)
-- `details`: Error details (on error)
+### Execution Safety
+- Direct execution for proper TCC dialog display
+- Configurable timeout protection
+- Subprocess error handling
+- Memory and resource management
 
 ## System Requirements
 
-- macOS (AppleScript runtime environment)
-- Python 3.10+
-- uv package manager
+- **Operating System**: macOS (required for AppleScript runtime)
+- **Python**: 3.10 or higher
+- **Package Manager**: uv (recommended) or pip
+- **Permissions**: User must grant necessary TCC permissions for target applications
+
+## Development
+
+### Testing
+```bash
+# Validate syntax for all modules
+python3 -m py_compile mcp_server_osascript/*.py
+
+# Test individual modules
+python3 -c "from mcp_server_osascript.security import SecurityProfileManager; print('Security module OK')"
+```
+
+### Architecture Overview
+The codebase follows a modular design with clear separation of concerns:
+- Security assessment and policy enforcement
+- Script execution and subprocess management  
+- Permission handling and TCC error parsing
+- Standardized response formatting
+- User interface and confirmation dialogs
 
 ## License
 

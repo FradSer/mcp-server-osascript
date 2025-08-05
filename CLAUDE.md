@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an MCP (Model Context Protocol) server that provides secure AppleScript execution capabilities to AI applications. The server acts as a bridge between AI models and macOS automation through osascript, implementing multiple layers of security including script linting, user confirmation for high-risk operations, and TCC permission handling.
+This is an MCP (Model Context Protocol) server that provides secure AppleScript execution capabilities to AI applications. The server acts as a bridge between AI models and macOS automation through osascript, implementing configurable security profiles, automatic TCC permission handling, and comprehensive error management.
 
-Built using the MCP Python SDK's FastMCP framework for simplified server development.
+Built using the MCP Python SDK's FastMCP framework with a modular architecture for maintainability and extensibility.
 
 ## Development Environment
 
-**Python Requirements:**
+**Requirements:**
 - Python 3.10+ (project specifies `>=3.10` in pyproject.toml)
 - macOS (required for AppleScript execution)
 - uv package manager (recommended)
@@ -20,60 +20,94 @@ Built using the MCP Python SDK's FastMCP framework for simplified server develop
 # Install dependencies
 uv sync
 
-# Development mode installation
+# Development mode installation (optional)
 uv pip install -e .
 ```
 
-**Running the Server:**
+**Development Commands:**
 ```bash
-# From project directory
+# Run server from project directory
 uv run mcp-server-osascript
 
-# From any directory
+# Run from any directory
 uv run --project /path/to/mcp-server-osascript mcp-server-osascript
 
 # Alternative: Python module
 uv run python -m mcp_server_osascript.server
 
-# Test syntax
+# Syntax validation
 python3 -m py_compile mcp_server_osascript/server.py
+
+# Test all modules
+python3 -m py_compile mcp_server_osascript/*.py
 ```
 
-## Architecture
+**Production Installation:**
+```bash
+# Install with uvx for system-wide access
+uvx install /path/to/mcp-server-osascript
+# Then run with: mcp-server-osascript
+```
 
-**FastMCP Implementation** (`mcp_server_osascript/server.py`):
-- **Import**: Uses `from mcp.server import FastMCP` (not standalone fastmcp package)
-- **Tool Registration**: Single `@server.tool()` decorator for `execute_osascript`
-- **Security Layer**: Multi-stage security validation before script execution
-- **Execution Engine**: Direct osascript execution (no sandboxing) to allow TCC dialogs
-- **Tool Interface**: Single focused tool with structured input/output
+## Modular Architecture
 
-**Security Architecture (Defense in Depth):**
-1. **Script Linting**: Pre-execution analysis blocking dangerous patterns (`do shell script`, `delete`, etc.)
-2. **Risk Assessment**: High-risk operations flagged for user confirmation
-3. **Direct Execution**: No sandboxing to ensure TCC permission dialogs can appear
-4. **TCC Handling**: Intelligent parsing of macOS permission errors with user guidance
+The codebase is organized into 6 focused modules that work together:
 
-**Core Functions:**
-- `lint_applescript()`: Security pattern matching and risk assessment
-- `get_user_confirmation()`: Interactive confirmation for high-risk scripts
-- `parse_tcc_error()`: TCC permission error analysis and user guidance
-- `execute_osascript()`: Main tool decorated with `@server.tool()`
-- `execute_osascript_safely()`: Wrapper with security checks
-- `execute_osascript_direct()`: Direct osascript execution
+**`server.py`** - FastMCP server and tool registration
+- Main entry point with `serve()` function
+- Single `@server.tool()` decorator for `execute_osascript`
+- Coordinates between security, execution, and permission modules
+- Global component initialization (security_manager, permission_handler, execution_manager)
 
-**Error Handling Strategy:**
-- Structured dictionary responses with specific error types
-- Clear user guidance for permission issues
-- Timeout handling for long-running scripts (default 20s)
-- Comprehensive subprocess error capture
+**`security.py`** - Configurable security profile system
+- `SecurityProfileManager`: Manages risk assessment and policy enforcement
+- `RiskLevel` enum: LOW/MEDIUM/HIGH/CRITICAL risk classification
+- `SecurityDecision` enum: ALLOW/WARN/CONFIRM/BLOCK decisions
+- Three security profiles: "strict", "balanced", "permissive"
+- Regex-based pattern matching for dangerous operations
+
+**`executor.py`** - Script execution engine
+- `ScriptExecutor`: Handles direct osascript execution with timeouts
+- `AnalysisEngine`: Combines security analysis with execution capabilities
+- `ExecutionManager`: High-level coordinator integrating security and permissions
+- Comprehensive subprocess error handling and timeout management
+
+**`permissions.py`** - TCC permission management
+- `PermissionHandler`: Automatic TCC permission dialog triggering
+- `parse_tcc_error()`: Intelligent TCC error parsing (-1743 detection)
+- `TCC_TRIGGER_SCRIPTS`: Pre-defined scripts to trigger permission dialogs
+- Provides detailed user guidance for permission configuration
+
+**`responses.py`** - Standardized response formatting
+- `StandardResponse`: Consistent success/error response building
+- `ExecutionResponseBuilder`: Specialized responses for script execution
+- `ProfileResponseBuilder`: Security profile-specific response formatting
+- Eliminates response duplication across modules
+
+**`ui.py`** - User interface and formatting utilities
+- `UIFormatter`: Consistent formatting for headers, lists, and displays
+- `InteractiveDisplay`: User confirmation dialogs and interactive prompts
+- Supports the user confirmation flow for high-risk operations
 
 ## Key Implementation Details
 
-**MCP SDK Integration**: Uses `mcp>=1.0.0` which includes FastMCP. Import pattern is `from mcp.server import FastMCP`.
+**MCP Integration**: Uses `mcp>=1.0.0` with `from mcp.server import FastMCP`. The server exposes a single comprehensive tool rather than multiple specialized tools.
 
-**Security Patterns**: Regex-based pattern matching to identify blocked operations (shell scripts, system commands) and high-risk operations (keyboard/mouse control, System Events).
+**Security Profile System**: Replaced hard-coded blocking with configurable profiles. Users can choose between strict (maximum security), balanced (recommended default), or permissive (minimal restrictions) profiles.
 
-**TCC Permission System**: Handles macOS TCC (Transparency, Consent, and Control) permission errors with error code -1743 detection and provides helpful user guidance including manual commands.
+**Automatic Permission Handling**: The `enable_auto_permissions` parameter allows automatic TCC permission dialog triggering, reducing user friction while maintaining security.
 
-**No Sandboxing**: Removed sandbox execution to ensure TCC permission dialogs can be properly triggered in client applications.
+**Error Handling Strategy**: All modules use standardized response dictionaries with specific error types, clear user guidance, and comprehensive error details including repair suggestions.
+
+**Direct Execution Model**: No sandboxing to ensure TCC permission dialogs can appear properly in client applications. Timeout handling prevents hanging processes.
+
+## Tool Interface
+
+**`execute_osascript`** - The single comprehensive tool with these parameters:
+- `script` (str): AppleScript/JavaScript code to execute
+- `execution_timeout` (int, default=30): Timeout in seconds
+- `security_profile` (str, default="balanced"): "strict"/"balanced"/"permissive"
+- `enable_auto_permissions` (bool, default=True): Auto-trigger TCC dialogs
+- `dry_run` (bool, default=False): Analyze without executing
+
+**Response Structure**: All responses follow `StandardResponse` format with `status`, `timestamp`, and either `data` (success) or `error` (failure) fields.
