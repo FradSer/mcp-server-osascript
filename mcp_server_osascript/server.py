@@ -7,7 +7,7 @@ from mcp.server import FastMCP
 from .security import SecurityProfileManager
 from .permissions import PermissionHandler
 from .executor import ExecutionManager
-from .responses import StandardResponse, ProfileResponseBuilder
+from .responses import ResponseBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -89,28 +89,11 @@ def serve() -> FastMCP:
         """
         try:
             profiles_info = security_manager.list_profiles()
-            
-            usage_stats = {
-                'total_evaluations': len(security_manager.audit_log),
-                'recent_evaluations': len([
-                    log for log in security_manager.audit_log[-100:]
-                    if datetime.fromisoformat(log['timestamp']) > 
-                       datetime.now() - timedelta(hours=24)
-                ]) if security_manager.audit_log else 0
-            }
-            
-            return ProfileResponseBuilder.profiles_list(
-                profiles_info, 
-                usage_stats
-            )
-            
+            return ResponseBuilder.success(data={'available_profiles': profiles_info})
         except Exception as e:
             logger.error(f"Error getting security profiles: {e}")
-            return StandardResponse.error(
-                'CONFIGURATION_ERROR',
-                'Failed to retrieve security profiles',
-                details={'error_message': str(e)}
-            )
+            return ResponseBuilder.error('CONFIGURATION_ERROR', 'Failed to retrieve security profiles',
+                                       details={'error_message': str(e)})
     
     @server.tool()
     def set_security_profile(security_profile: str) -> Dict[str, Any]:
@@ -128,23 +111,22 @@ def serve() -> FastMCP:
         """
         try:
             if security_profile not in security_manager.profiles:
-                return ProfileResponseBuilder.invalid_profile(
-                    security_profile, 
-                    list(security_manager.profiles.keys())
-                )
+                return ResponseBuilder.error('INVALID_PROFILE', f"Unknown security profile: {security_profile}",
+                                           details={'available_profiles': list(security_manager.profiles.keys())})
             
             old_profile = security_manager.default_profile
             security_manager.default_profile = security_profile
             
-            return ProfileResponseBuilder.profile_changed(old_profile, security_profile)
+            return ResponseBuilder.success(data={
+                'message': f"Profile changed from '{old_profile}' to '{security_profile}'",
+                'previous_profile': old_profile,
+                'new_profile': security_profile
+            })
             
         except Exception as e:
             logger.error(f"Error setting default security profile: {e}")
-            return StandardResponse.error(
-                'CONFIGURATION_ERROR',
-                'Failed to set default security profile',
-                details={'error_message': str(e)}
-            )
+            return ResponseBuilder.error('CONFIGURATION_ERROR', 'Failed to set default security profile',
+                                       details={'error_message': str(e)})
     
     return server
 
