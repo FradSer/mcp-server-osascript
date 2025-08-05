@@ -5,66 +5,216 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
 
 from mcp.server import FastMCP
+from .security import SecurityProfileManager, SecurityDecision, RiskLevel
 
 logger = logging.getLogger(__name__)
 
-def lint_applescript(script: str) -> Dict[str, Any]:
+# Initialize global security manager
+security_manager = SecurityProfileManager()
+
+# TCC trigger scripts for automatic permission handling
+TCC_TRIGGER_SCRIPTS = {
+    "System Events": 'tell application "System Events" to get name of first process',
+    "Music": 'tell application "Music" to get player state',
+    "Finder": 'tell application "Finder" to get name of desktop',
+    "Safari": 'tell application "Safari" to get name of front window',
+    "Google Chrome": 'tell application "Google Chrome" to get title of front window'
+}
+
+
+class PermissionHandler:
     """
-    Lint AppleScript for security issues and risk assessment.
+    Internal class to handle TCC permissions automatically.
+    Hides macOS permission complexity from users.
+    """
     
-    Args:
-        script: The AppleScript code to lint
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def auto_handle_permissions(self, error_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Automatically attempt to resolve TCC permission issues.
         
-    Returns:
-        Dictionary containing lint results with 'blocked', 'high_risk', and 'issues' keys
-    """
-    blocked_patterns = [
-        r'\bdo\s+shell\s+script\b',
-        r'\bdelete\b.*\btrash\b',
-        r'\bempty\s+trash\b',
-        r'\brm\s+-rf\b',
-        r'\bsudo\b',
-        r'\bkillall\b',
-        r'\bshutdown\b',
-        r'\brestart\b',
-        r'\bformat\b',
-        r'\bfdisk\b',
-        r'\bdiskutil\b.*\berase\b',
-    ]
+        Args:
+            error_result: Error result from script execution
+            
+        Returns:
+            Enhanced error result with automatic permission handling
+        """
+        if not self._is_tcc_error(error_result):
+            return error_result
+        
+        # Parse TCC error and attempt automatic resolution
+        tcc_info = parse_tcc_error(error_result.get('stderr', ''))
+        if not tcc_info:
+            return error_result
+        
+        app_name = tcc_info.get('app_name', 'System Events')
+        
+        # Attempt to trigger permission dialog automatically
+        permission_result = self._trigger_permission_dialog(app_name)
+        
+        # Enhance error message with actionable guidance
+        enhanced_result = error_result.copy()
+        enhanced_result.update({
+            'permission_info': {
+                'app_name': app_name,
+                'auto_trigger_attempted': True,
+                'auto_trigger_result': permission_result,
+                'user_guidance': self._get_user_guidance(app_name),
+                'next_steps': [
+                    f"Check for permission dialog for '{app_name}'",
+                    "If dialog appeared, click 'OK' to grant access",
+                    "If no dialog, go to System Settings > Privacy & Security > Automation",
+                    f"Enable automation permissions for your terminal/app to control '{app_name}'",
+                    "Then retry your script"
+                ]
+            }
+        })
+        
+        return enhanced_result
     
-    high_risk_patterns = [
-        r'\bkeystroke\b',
-        r'\bkey\s+code\b',
-        r'\bmouse\b',
-        r'\bclick\b',
-        r'\bSystem\s+Events\b',
-        r'\bUI\s+scripting\b',
-        r'\bGUI\s+scripting\b',
-        r'\bquit\b',
-        r'\blaunch\b',
-        r'\bopen\b.*\bapplication\b',
-    ]
+    def _is_tcc_error(self, error_result: Dict[str, Any]) -> bool:
+        """Check if error is related to TCC permissions."""
+        stderr = error_result.get('stderr', '').lower()
+        return any(pattern in stderr for pattern in ['-1743', 'not authorized', 'permission'])
     
-    issues = []
+    def _trigger_permission_dialog(self, app_name: str) -> Dict[str, Any]:
+        """
+        Attempt to trigger TCC permission dialog for the specified app.
+        
+        Returns:
+            Dictionary with trigger attempt results
+        """
+        trigger_script = TCC_TRIGGER_SCRIPTS.get(app_name, TCC_TRIGGER_SCRIPTS["System Events"])
+        
+        try:
+            self.logger.info(f"Attempting to trigger TCC dialog for {app_name}")
+            
+            # Try direct execution first
+            result = subprocess.run(
+                ['osascript', '-e', trigger_script],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                return {
+                    'method': 'direct_execution',
+                    'success': True,
+                    'message': f'Successfully triggered permission request for {app_name}'
+                }
+            
+            # If direct execution fails, try terminal method
+            return self._trigger_via_terminal(trigger_script, app_name)
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to auto-trigger TCC dialog: {e}")
+            return {
+                'method': 'auto_trigger',
+                'success': False,
+                'message': f'Could not automatically trigger permission dialog: {str(e)}'
+            }
     
-    for pattern in blocked_patterns:
-        if re.search(pattern, script, re.IGNORECASE):
-            issues.append(f"Blocked pattern detected: {pattern}")
+    def _trigger_via_terminal(self, script: str, app_name: str) -> Dict[str, Any]:
+        """Attempt to trigger permission dialog via Terminal."""
+        try:
+            # Create temporary script
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.command', delete=False) as f:
+                f.write(f'#!/bin/bash\n')
+                f.write(f'echo "Triggering TCC permission dialog for {app_name}..."\n')
+                escaped_script = script.replace("'", "'\\''")
+                f.write(f'osascript -e \'{escaped_script}\'\n')
+                f.write(f'echo "Permission dialog should have appeared. Close this window."\n')
+                f.write(f'read -p "Press Enter to continue..."\n')
+                temp_script = f.name
+            
+            os.chmod(temp_script, 0o755)
+            
+            # Open in Terminal
+            result = subprocess.run(
+                ['open', '-a', 'Terminal', temp_script],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            return {
+                'method': 'terminal_trigger',
+                'success': result.returncode == 0,
+                'message': f'Opened Terminal to trigger {app_name} permission dialog',
+                'temp_script': temp_script
+            }
+            
+        except Exception as e:
+            return {
+                'method': 'terminal_trigger', 
+                'success': False,
+                'message': f'Terminal trigger failed: {str(e)}'
+            }
     
-    high_risk = False
-    for pattern in high_risk_patterns:
-        if re.search(pattern, script, re.IGNORECASE):
-            high_risk = True
-            issues.append(f"High-risk pattern detected: {pattern}")
+    def _get_user_guidance(self, app_name: str) -> List[str]:
+        """Get user-friendly guidance for resolving TCC permissions."""
+        return [
+            f"Your script needs permission to control '{app_name}'",
+            "This is a normal macOS security feature",
+            "Grant permission when the dialog appears, or manually in System Settings",
+            "This only needs to be done once per application"
+        ]
+
+
+# Initialize global permission handler
+permission_handler = PermissionHandler()
+
+
+class StandardResponse:
+    """Standardized response builder for consistent API responses."""
     
-    return {
-        'blocked': len([issue for issue in issues if issue.startswith('Blocked')]) > 0,
-        'high_risk': high_risk,
-        'issues': issues
-    }
+    @staticmethod
+    def success(data: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
+        """Build standardized success response."""
+        result = {
+            'status': 'success',
+            'timestamp': datetime.now().isoformat()
+        }
+        if data:
+            result['data'] = data
+        result.update(kwargs)
+        return result
+    
+    @staticmethod
+    def error(error_type: str, message: str, details: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
+        """Build standardized error response."""
+        result = {
+            'status': 'error',
+            'error': {
+                'type': error_type,
+                'message': message,
+                'timestamp': datetime.now().isoformat()
+            }
+        }
+        if details:
+            result['error']['details'] = details
+        result.update(kwargs)
+        return result
+    
+    @staticmethod
+    def warning(message: str, data: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
+        """Build standardized warning response."""
+        result = {
+            'status': 'warning',
+            'message': message,
+            'timestamp': datetime.now().isoformat()
+        }
+        if data:
+            result['data'] = data
+        result.update(kwargs)  
+        return result
 
 def get_user_confirmation(script: str) -> bool:
     """
@@ -149,6 +299,26 @@ def parse_tcc_error(stderr: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _build_error_response(error_type: str, details: str, **kwargs) -> Dict[str, Any]:
+    """Build standardized error response dictionary."""
+    return {
+        'status': 'error',
+        'type': error_type,
+        'details': details,
+        **kwargs
+    }
+
+
+def _build_success_response(stdout: str = "", stderr: str = "", **kwargs) -> Dict[str, Any]:
+    """Build standardized success response dictionary."""
+    return {
+        'status': 'success',
+        'stdout': stdout,
+        'stderr': stderr,
+        **kwargs
+    }
+
+
 def execute_osascript_direct(script: str, timeout: int = 20) -> Dict[str, Any]:
     """
     Execute AppleScript directly with enhanced TCC dialog triggering.
@@ -164,9 +334,7 @@ def execute_osascript_direct(script: str, timeout: int = 20) -> Dict[str, Any]:
         Dictionary with execution results
     """
     try:
-        # Use synchronous execution to ensure TCC dialogs work properly
         cmd = ['osascript', '-e', script]
-        
         logger.info(f"Executing osascript command: {' '.join(cmd[:2])}...")
         
         result = subprocess.run(
@@ -176,83 +344,68 @@ def execute_osascript_direct(script: str, timeout: int = 20) -> Dict[str, Any]:
             timeout=timeout
         )
         
-        stdout_str = result.stdout
-        stderr_str = result.stderr
-        
         if result.returncode == 0:
-            return {
-                'status': 'success',
-                'stdout': stdout_str,
-                'stderr': stderr_str
-            }
-        else:
-            tcc_error = parse_tcc_error(stderr_str)
-            if tcc_error:
-                return {
-                    'status': 'error',
-                    **tcc_error,
-                    'stdout': stdout_str,
-                    'stderr': stderr_str
-                }
-            
+            return _build_success_response(result.stdout, result.stderr)
+        
+        # Handle TCC errors specially
+        tcc_error = parse_tcc_error(result.stderr)
+        if tcc_error:
             return {
                 'status': 'error',
-                'type': 'EXECUTION_FAILED',
-                'details': f"osascript exited with code {result.returncode}",
-                'stdout': stdout_str,
-                'stderr': stderr_str
+                **tcc_error,
+                'stdout': result.stdout,
+                'stderr': result.stderr
             }
+        
+        return _build_error_response(
+            'EXECUTION_FAILED',
+            f"osascript exited with code {result.returncode}",
+            stdout=result.stdout,
+            stderr=result.stderr
+        )
             
     except subprocess.TimeoutExpired:
-        return {
-            'status': 'error',
-            'type': 'TIMEOUT',
-            'details': f"Script execution timed out after {timeout} seconds"
-        }
+        return _build_error_response('TIMEOUT', f"Script execution timed out after {timeout} seconds")
     except Exception as e:
-        return {
-            'status': 'error',
-            'type': 'SYSTEM_ERROR',
-            'details': f"System error: {str(e)}"
-        }
+        return _build_error_response('SYSTEM_ERROR', f"System error: {str(e)}")
 
-def try_trigger_tcc_via_terminal(script: str, tcc_error: Dict[str, str]) -> Optional[Dict[str, Any]]:
+def _create_terminal_script(script: str, app_name: str = "application") -> str:
+    """Create a temporary terminal script for TCC dialog triggering."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.command', delete=False) as f:
+        escaped_script = script.replace("'", "'\\''")
+        f.write(f'#!/bin/bash\n')
+        f.write(f'echo "Triggering TCC permission dialog for {app_name}..."\n')
+        f.write(f'echo "Script: {script[:50]}..."\n')
+        f.write(f'echo ""\n')
+        f.write(f'osascript -e \'{escaped_script}\'\n')
+        f.write(f'echo ""\n')
+        f.write(f'echo "If a permission dialog appeared, click OK to grant access."\n')
+        f.write(f'echo "If no dialog appeared, check System Settings > Privacy & Security > Automation"\n')
+        f.write(f'echo ""\n')
+        f.write(f'echo "Press Enter to close this window..."\n')
+        f.write(f'read\n')
+        temp_script = f.name
+    
+    os.chmod(temp_script, 0o755)
+    return temp_script
+
+
+def trigger_tcc_via_terminal(script: str, app_name: str = "application") -> Dict[str, Any]:
     """
-    Try to trigger TCC dialog by executing via terminal or other methods.
+    Universal TCC dialog trigger by creating a Terminal script.
     
     Args:
-        script: The AppleScript code
-        tcc_error: The TCC error information
+        script: The AppleScript code to execute
+        app_name: Name of the application for user messaging
         
     Returns:
-        Result dictionary if successful, None otherwise
+        Result dictionary with instructions
     """
     try:
-        # Method 1: Create a temporary script and open it in Terminal
-        # This approach is more reliable for triggering TCC dialogs
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.command', delete=False) as f:
-            f.write(f'#!/bin/bash\n')
-            f.write(f'echo "Attempting to trigger TCC permission dialog..."\n')
-            f.write(f'echo "Script: {script[:50]}..."\n')
-            f.write(f'echo ""\n')
-            escaped_script = script.replace("'", "'\\''")
-            f.write(f'osascript -e \'{escaped_script}\'\n')
-            f.write(f'echo ""\n')
-            f.write(f'echo "If a permission dialog appeared, click OK to grant access."\n')
-            f.write(f'echo "Then try running your script again in the MCP client."\n')
-            f.write(f'echo "If no dialog appeared, check System Settings > Privacy & Security > Automation"\n')
-            f.write(f'echo ""\n')
-            f.write(f'echo "Press Enter to close this window..."\n')
-            f.write(f'read\n')
-            temp_script = f.name
-        
-        # Make it executable
-        os.chmod(temp_script, 0o755)
-        
+        temp_script = _create_terminal_script(script, app_name)
         logger.info(f"Created temporary script: {temp_script}")
         
-        # Try to open it with Terminal
+        # Open script with Terminal
         result = subprocess.run(
             ['open', '-a', 'Terminal', temp_script],
             capture_output=True,
@@ -262,499 +415,538 @@ def try_trigger_tcc_via_terminal(script: str, tcc_error: Dict[str, str]) -> Opti
         
         if result.returncode == 0:
             return {
-                'status': 'tcc_dialog_trigger_attempted',
-                'message': 'TCC dialog should appear in Terminal window',
-                'instructions': [
-                    'A Terminal window should have opened',
-                    'If a permission dialog appears, click "OK" to grant access',
-                    'Then try running your script again',
-                    'If no dialog appears, check System Settings > Privacy & Security > Automation'
-                ],
-                'cleanup_note': f'Temporary script created: {temp_script}'
-            }
-        
-    except Exception as e:
-        logger.warning(f"Terminal script creation failed: {e}")
-    
-    # Method 2: Try to execute via AppleScript to Terminal
-    try:
-        escaped_script = script.replace("'", "'\\''")
-        terminal_script = f'''
-        tell application "Terminal"
-            activate
-            do script "osascript -e '{escaped_script}'"
-        end tell
-        '''
-        
-        logger.info("Attempting to trigger TCC dialog via Terminal.app")
-        
-        result = subprocess.run(
-            ['osascript', '-e', terminal_script],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0:
-            logger.info("Terminal execution successful")
-            return {
-                'status': 'success',
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'method': 'terminal_execution'
-            }
-        
-    except Exception as e:
-        logger.warning(f"Terminal execution failed: {e}")
-    
-    return None
-
-def execute_osascript_safely(script: str, timeout: int = 20) -> Dict[str, Any]:
-    """
-    Execute AppleScript safely with security checks (no sandbox).
-    
-    Args:
-        script: The AppleScript code to execute
-        timeout: Timeout in seconds
-        
-    Returns:
-        Dictionary with execution results
-    """
-    lint_result = lint_applescript(script)
-    
-    if lint_result['blocked']:
-        return {
-            'status': 'error',
-            'type': 'SCRIPT_REJECTED_BY_LINTER',
-            'details': 'Script contains blocked patterns',
-            'issues': lint_result['issues']
-        }
-    
-    if lint_result['high_risk']:
-        if not get_user_confirmation(script):
-            return {
-                'status': 'error',
-                'type': 'USER_CANCELLED',
-                'details': 'User cancelled high-risk operation',
-                'issues': lint_result['issues']
-            }
-    
-    # Execute directly without sandbox to allow TCC dialogs
-    logger.info("Executing AppleScript directly (no sandbox) to allow TCC permissions")
-    return execute_osascript_direct(script, timeout)
-
-def serve() -> FastMCP:
-    """Create and configure the FastMCP server."""
-    server = FastMCP("mcp-server-osascript")
-    
-    @server.tool()
-    def execute_osascript(script: str, timeout: int = 20) -> Dict[str, Any]:
-        """
-        Execute AppleScript code safely with security checks (no sandbox).
-        
-        This tool provides secure execution of AppleScript code through multiple layers
-        of security including script linting and user confirmation for high-risk operations.
-        Scripts are executed directly without sandboxing to ensure TCC permission dialogs
-        can be properly triggered.
-        
-        Security Features:
-        - Pre-execution linting to block dangerous patterns
-        - User confirmation for high-risk operations
-        - TCC permission error handling with helpful guidance
-        - Direct execution to allow macOS permission dialogs
-        
-        Args:
-            script: The AppleScript code to execute
-            timeout: Maximum execution time in seconds (default: 20)
-            
-        Returns:
-            Dictionary containing:
-            - status: "success" or "error"
-            - stdout: Standard output (on success)
-            - stderr: Standard error (on success)
-            - type: Error type (on error)
-            - details: Error details (on error)
-            - issues: Security issues found (on linting errors)
-            
-        Blocked Patterns:
-        - Shell script execution (do shell script)
-        - File deletion operations
-        - System administration commands
-        - Potentially destructive operations
-        
-        High-Risk Patterns (require user confirmation):
-        - Keyboard/mouse control
-        - System Events usage
-        - GUI scripting
-        - Application control
-        
-        Common TCC Permission Errors:
-        If you receive a TCC_PERMISSION_DENIED error, you need to grant
-        automation permissions in System Settings > Privacy & Security > Automation.
-        """
-        logger.info(f"Executing AppleScript: {script[:100]}...")
-        
-        if not script or not script.strip():
-            return {
-                'status': 'error',
-                'type': 'EMPTY_SCRIPT',
-                'details': 'Script cannot be empty'
-            }
-        
-        return execute_osascript_safely(script, timeout)
-    
-    @server.tool()
-    def force_tcc_dialog(app_name: str = "System Events") -> Dict[str, Any]:
-        """
-        Force trigger TCC permission dialog by opening Terminal.
-        
-        This tool creates a temporary Terminal session to run osascript directly,
-        which should trigger the TCC permission dialog that doesn't appear when
-        running from within other applications.
-        
-        Args:
-            app_name: Name of the application to trigger permission for
-            
-        Returns:
-            Dictionary with instructions and expected behavior
-        """
-        trigger_scripts = {
-            "System Events": 'tell application "System Events" to get name of first process',
-            "Music": 'tell application "Music" to get player state',
-            "Finder": 'tell application "Finder" to get name of desktop',
-            "Safari": 'tell application "Safari" to get name of front window',
-            "Google Chrome": 'tell application "Google Chrome" to get title of front window'
-        }
-        
-        script = trigger_scripts.get(app_name, f'tell application "{app_name}" to get name')
-        
-        try:
-            # Create a temporary script file that will be opened in Terminal
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.command', delete=False) as f:
-                f.write(f'#!/bin/bash\n')
-                f.write(f'echo "Triggering TCC permission dialog for {app_name}..."\n')
-                escaped_script = script.replace("'", "'\\''")
-                f.write(f'osascript -e \'{escaped_script}\'\n')
-                f.write(f'echo ""\n')
-                f.write(f'echo "If a permission dialog appeared, click OK to grant access."\n')
-                f.write(f'echo "If no dialog appeared, check System Settings > Privacy & Security > Automation"\n')
-                f.write(f'echo ""\n')
-                f.write(f'echo "Press Enter to close this window..."\n')
-                f.write(f'read\n')
-                temp_script = f.name
-            
-            # Make it executable
-            os.chmod(temp_script, 0o755)
-            
-            # Open it with Terminal
-            result = subprocess.run(
-                ['open', '-a', 'Terminal', temp_script],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            return {
                 'status': 'tcc_dialog_opened',
                 'message': f'Terminal window opened to trigger TCC dialog for {app_name}',
                 'instructions': [
                     'A Terminal window should have opened',
                     'The script will run automatically',
                     'If a permission dialog appears, click "OK"',
-                    'If no dialog appears, permissions may already be granted or denied',
+                    'If no dialog appears, permissions may already be granted',
                     'Check System Settings > Privacy & Security > Automation for manual setup'
-                ],
-                'next_steps': [
-                    'After granting permission, try your original script again',
-                    'The permission should now work for all scripts targeting this app'
                 ],
                 'cleanup_note': f'Temporary script created: {temp_script}'
             }
-            
-        except Exception as e:
-            return {
-                'status': 'error',
-                'type': 'TERMINAL_TRIGGER_FAILED',
-                'details': f'Failed to trigger TCC dialog: {str(e)}',
-                'fallback_instructions': [
-                    'Try running this command manually in Terminal:',
-                    f'osascript -e \'{script}\'',
-                    'Or check System Settings > Privacy & Security > Automation'
-                ]
-            }
-
-    @server.tool()
-    def trigger_tcc_permission(app_name: str = "Music") -> Dict[str, Any]:
-        """
-        Trigger TCC permission dialog for a specific application.
-        
-        This tool intentionally runs a simple AppleScript command to force macOS
-        to show the permission dialog for controlling the specified application.
-        
-        Args:
-            app_name: Name of the application to trigger permission for (default: "Music")
-            
-        Returns:
-            Dictionary with instructions and expected behavior
-        """
-        trigger_scripts = {
-            "Music": 'tell application "Music" to get player state',
-            "System Events": 'tell application "System Events" to get name of first process',
-            "Finder": 'tell application "Finder" to get name of desktop',
-            "Safari": 'tell application "Safari" to get name of front window',
-            "Google Chrome": 'tell application "Google Chrome" to get title of front window'
-        }
-        
-        script = trigger_scripts.get(app_name, f'tell application "{app_name}" to get name')
-        
-        result = execute_osascript_safely(script, timeout=5)
-        
-        if result.get('type') == 'TCC_PERMISSION_DENIED':
-            return {
-                'status': 'permission_dialog_triggered',
-                'message': f"TCC permission dialog should appear for {app_name}",
-                'expected_behavior': [
-                    f"A system dialog should appear asking to allow control of {app_name}",
-                    "Click 'OK' to grant permission",
-                    "If no dialog appears, use the reset commands below",
-                    "Then try running this command again"
-                ],
-                'reset_commands': [
-                    "sudo tccutil reset AppleEvents",
-                    "sudo killall -9 tccd",
-                    "Then run this tool again"
-                ]
-            }
-        elif result.get('status') == 'success':
-            return {
-                'status': 'already_granted',
-                'message': f"Permission already granted for {app_name}",
-                'app_name': app_name
-            }
         else:
-            return {
-                'status': 'unexpected_error',
-                'message': result.get('details', 'Unknown error'),
-                'type': result.get('type')
-            }
-
-    @server.tool()
-    def reset_tcc_permissions() -> Dict[str, Any]:
-        """
-        Reset TCC permissions to allow new permission dialogs.
-        
-        This tool resets the TCC (Transparency, Consent, and Control) database
-        to force macOS to show permission dialogs again. This is useful when
-        permissions were denied and need to be re-requested.
-        
-        Returns:
-            Dictionary with reset results and instructions
-        """
-        import getpass
-        
-        current_user = getpass.getuser()
-        
-        try:
-            # Reset AppleEvents permissions
-            cmd = ['sudo', 'tccutil', 'reset', 'AppleEvents']
-            process = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True
+            return _build_error_response(
+                'TERMINAL_OPEN_FAILED',
+                'Failed to open Terminal script',
+                fallback='Try running the script manually in Terminal'
             )
             
-            if process.returncode == 0:
-                # Also try to restart the TCC daemon
-                restart_cmd = ['sudo', 'killall', '-9', 'tccd']
-                restart_process = subprocess.run(
-                    restart_cmd,
-                    capture_output=True,
-                    text=True
-                )
-                
-                return {
-                    'status': 'success',
-                    'message': 'TCC permissions reset successfully',
-                    'next_steps': [
-                        'Run your AppleScript again',
-                        'You should now see permission dialogs',
-                        'Click "OK" to grant permissions',
-                        'If no dialogs appear, try running the script directly: osascript -e "your script"'
-                    ]
-                }
-            else:
-                stderr_str = process.stderr
-                return {
-                    'status': 'error',
-                    'type': 'RESET_FAILED',
-                    'details': f'Failed to reset TCC permissions: {stderr_str}',
-                    'suggestion': 'Try running the reset command manually: sudo tccutil reset AppleEvents'
-                }
-                
-        except Exception as e:
-            return {
-                'status': 'error',
-                'type': 'SYSTEM_ERROR',
-                'details': f'Error resetting TCC permissions: {str(e)}',
-                'manual_commands': [
-                    'sudo tccutil reset AppleEvents',
-                    'sudo killall -9 tccd'
+    except Exception as e:
+        return _build_error_response(
+            'TERMINAL_TRIGGER_FAILED',
+            f'Failed to trigger TCC dialog: {str(e)}',
+            fallback_instructions=[
+                'Try running this command manually in Terminal:',
+                f'osascript -e \'{script}\'',
+                'Or check System Settings > Privacy & Security > Automation'
+            ]
+        )
+
+def _build_security_error_response(security_result, error_type: str, details: str) -> Dict[str, Any]:
+    """Build standardized security error response."""
+    return {
+        'status': 'error',
+        'type': error_type,
+        'details': details,
+        'security': {
+            'profile': security_result.metadata.get('profile'),
+            'risk_level': security_result.risk_level.value,
+            'risk_score': security_result.risk_score,
+            'issues': security_result.issues,
+            'warnings': security_result.warnings,
+            'decision': security_result.decision.value
+        }
+    }
+
+
+def _add_security_metadata(execution_result: Dict[str, Any], security_result) -> Dict[str, Any]:
+    """Add security metadata to successful execution result."""
+    if execution_result.get('status') == 'success':
+        execution_result['security'] = {
+            'profile': security_result.metadata.get('profile'),
+            'risk_level': security_result.risk_level.value,
+            'risk_score': security_result.risk_score,
+            'warnings': security_result.warnings,
+            'audit_patterns': [p.get('description') for p in security_result.metadata.get('patterns', [])]
+        }
+    return execution_result
+
+
+def execute_osascript_with_security(
+    script: str, 
+    timeout: int = 20, 
+    security_profile: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Execute AppleScript with configurable security checks.
+    
+    Args:
+        script: The AppleScript code to execute
+        timeout: Timeout in seconds
+        security_profile: Security profile to use ('strict', 'balanced', 'permissive')
+        
+    Returns:
+        Dictionary with execution results and security metadata
+    """
+    # Evaluate security
+    security_result = security_manager.evaluate_script(script, security_profile)
+    
+    # Handle security decisions
+    if security_result.decision == SecurityDecision.BLOCK:
+        return _build_security_error_response(
+            security_result, 'SECURITY_BLOCK', 'Script blocked by security policy'
+        )
+    
+    elif security_result.decision == SecurityDecision.CONFIRM:
+        if not get_user_confirmation_enhanced(script, security_result):
+            return _build_security_error_response(
+                security_result, 'USER_CANCELLED', 'User cancelled risky operation'
+            )
+    
+    # Execute the script
+    logger.info(f"Executing AppleScript with {security_result.metadata.get('profile', 'default')} security profile")
+    execution_result = execute_osascript_direct(script, timeout)
+    
+    # Add security metadata to result
+    return _add_security_metadata(execution_result, security_result)
+
+
+def _display_security_header(security_result) -> None:
+    """Display security review header information."""
+    print("\n" + "="*70)
+    print("SECURITY REVIEW REQUIRED")
+    print("="*70)
+    print(f"Risk Level: {security_result.risk_level.value.upper()}")
+    print(f"Risk Score: {security_result.risk_score}/100")
+    print(f"Security Profile: {security_result.metadata.get('profile', 'unknown')}")
+    print("-" * 70)
+
+
+def _display_security_warnings(security_result) -> None:
+    """Display security warnings if present."""
+    if security_result.warnings:
+        print("Security Concerns:")
+        for warning in security_result.warnings:
+            print(f"  ⚠️  {warning}")
+        print("-" * 70)
+
+
+def _display_script_preview(script: str) -> None:
+    """Display a preview of the script to be executed."""
+    print("Script Preview:")
+    script_lines = script.split('\n')[:5]  # Show first 5 lines
+    for i, line in enumerate(script_lines, 1):
+        print(f"  {i:2}: {line}")
+    total_lines = len(script.split('\n'))
+    if total_lines > 5:
+        remaining_lines = total_lines - 5
+        print(f"  ... ({remaining_lines} more lines)")
+    print("-" * 70)
+
+
+def _display_detected_patterns(security_result) -> None:
+    """Display detected security patterns."""
+    print("Patterns Detected:")
+    patterns = security_result.metadata.get('patterns', [])
+    if patterns:
+        for pattern in patterns[:3]:  # Show first 3 patterns
+            risk_level = pattern.get('risk_level', 'unknown')
+            if hasattr(risk_level, 'value'):
+                risk_level = risk_level.value
+            print(f"  • {pattern.get('description', 'Unknown')} (Risk: {risk_level})")
+        if len(patterns) > 3:
+            print(f"  ... and {len(patterns) - 3} more")
+    else:
+        print("  No high-risk patterns detected")
+
+
+def _display_detailed_analysis(security_result) -> None:
+    """Display detailed security analysis."""
+    print("\nDetailed Security Analysis:")
+    print(f"Profile: {security_result.metadata.get('profile')}")
+    for category, patterns_in_cat in security_result.metadata.get('patterns_by_category', {}).items():
+        if patterns_in_cat:
+            print(f"\n{category.replace('_', ' ').title()}:")
+            for pattern in patterns_in_cat:
+                print(f"  - {pattern.get('description')}")
+                if pattern.get('remediation'):
+                    print(f"    Suggestion: {pattern.get('remediation')}")
+    print()
+
+
+def get_user_confirmation_enhanced(script: str, security_result) -> bool:
+    """
+    Enhanced user confirmation with detailed security information.
+    
+    Args:
+        script: The AppleScript code to confirm
+        security_result: Security analysis result
+        
+    Returns:
+        True if user confirms, False otherwise
+    """
+    _display_security_header(security_result)
+    _display_security_warnings(security_result)
+    _display_script_preview(script)
+    _display_detected_patterns(security_result)
+    print("="*70)
+    
+    while True:
+        response = input("Do you want to proceed? (yes/no/details): ").strip().lower()
+        if response in ['yes', 'y']:
+            return True
+        elif response in ['no', 'n']:
+            return False
+        elif response in ['details', 'd']:
+            _display_detailed_analysis(security_result)
+        else:
+            print("Please enter 'yes', 'no', or 'details'")
+
+
+def _get_security_recommendations(security_result) -> List[str]:
+    """Generate security recommendations based on analysis."""
+    recommendations = []
+    
+    if security_result.risk_score > 70:
+        recommendations.append("Consider reviewing the script carefully before execution")
+    
+    if any('shell' in pattern.get('category', '') for pattern in security_result.metadata.get('patterns', [])):
+        recommendations.append("Shell script execution detected - ensure commands are safe")
+    
+    if security_result.decision == SecurityDecision.BLOCK:
+        recommendations.append("Switch to 'balanced' or 'permissive' profile if this script is legitimate")
+    
+    patterns = security_result.metadata.get('patterns', [])
+    critical_patterns = [p for p in patterns if p.get('risk_level') == 'critical']
+    if critical_patterns:
+        recommendations.append("Critical security patterns detected - verify script source")
+    
+    return recommendations
+
+
+def _suggest_security_level(security_result) -> str:
+    """Suggest appropriate security level based on risk analysis."""
+    if security_result.risk_score >= 90:
+        return "strict"
+    elif security_result.risk_score >= 50:
+        return "balanced"  
+    else:
+        return "permissive"
+
+
+# Keep old function for backward compatibility
+def execute_osascript_safely(script: str, timeout: int = 20) -> Dict[str, Any]:
+    """
+    Legacy function for backward compatibility.
+    Uses strict security profile to maintain old behavior.
+    """
+    return execute_osascript_with_security(script, timeout, 'strict')
+
+def _perform_security_analysis(script: str, security_profile: str) -> Dict[str, Any]:
+    """
+    Internal function to perform security analysis without execution.
+    This is the dry_run implementation for the execute_applescript tool.
+    """
+    if not script or not script.strip():
+        return StandardResponse.error(
+            'EMPTY_SCRIPT',
+            'Cannot analyze empty script',
+            details={'provided_script': script}
+        )
+    
+    try:
+        # Perform security analysis
+        security_result = security_manager.evaluate_script(script, security_profile)
+        
+        # Build comprehensive analysis response
+        analysis_data = {
+            'risk_assessment': {
+                'decision': security_result.decision.value,
+                'risk_level': security_result.risk_level.value,
+                'risk_score': security_result.risk_score,
+                'confidence': 'high' if security_result.risk_score > 50 else 'medium'
+            },
+            'security_findings': {
+                'issues_found': len(security_result.issues),
+                'warnings_found': len(security_result.warnings),
+                'patterns_detected': len(security_result.metadata.get('patterns', [])),
+                'critical_issues': security_result.issues,
+                'warnings': security_result.warnings
+            },
+            'recommendations': _get_security_recommendations(security_result),
+            'execution_guidance': {
+                'safe_to_execute': security_result.decision in [SecurityDecision.ALLOW, SecurityDecision.WARN],
+                'requires_confirmation': security_result.decision == SecurityDecision.CONFIRM,
+                'blocked': security_result.decision == SecurityDecision.BLOCK,
+                'suggested_security_profile': _suggest_security_level(security_result)
+            }
+        }
+        
+        # Add educational information for high-risk scripts
+        if security_result.risk_score > 70:
+            analysis_data['educational_info'] = {
+                'why_risky': f"This script has a risk score of {security_result.risk_score}/100",
+                'common_risks': [
+                    'May execute system commands',
+                    'Could modify files or system settings', 
+                    'Might access sensitive applications',
+                    'Could perform automation that affects other apps'
+                ],
+                'safety_tips': [
+                    'Review the script code carefully',
+                    'Ensure you trust the script source',
+                    'Test with non-critical data first',
+                    'Consider using a more restrictive security profile'
                 ]
             }
+        
+        return StandardResponse.success(
+            data=analysis_data,
+            metadata={
+                'analysis_timestamp': datetime.now().isoformat(),
+                'security_profile_used': security_profile,
+                'script_length': len(script),
+                'analysis_version': '2.0',
+                'dry_run': True
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error during security analysis: {e}")
+        return StandardResponse.error(
+            'ANALYSIS_ERROR',
+            'Failed to analyze script',
+            details={'error_message': str(e)}
+        )
 
+
+def serve() -> FastMCP:
+    """Create and configure the FastMCP server."""
+    server = FastMCP("mcp-server-osascript")
+    
     @server.tool()
-    def check_tcc_permissions() -> Dict[str, Any]:
+    def execute_osascript(
+        script: str, 
+        execution_timeout: int = 30, 
+        security_profile: str = "balanced",
+        enable_auto_permissions: bool = True,
+        dry_run: bool = False
+    ) -> Dict[str, Any]:
         """
-        Check and guide through TCC permission issues for AppleScript automation.
+        Execute or analyze scripts using osascript with comprehensive functionality and automatic permission handling.
         
-        This tool helps diagnose and fix TCC (Transparency, Consent, and Control)
-        permission problems when using AppleScript to control other applications.
+        This unified tool handles both AppleScript/JavaScript execution and security analysis with full osascript 
+        capabilities including shell script execution and intelligent TCC permission management.
         
-        Returns:
-            Dictionary with diagnostic information and step-by-step fix instructions
-        """
-        import getpass
+        Security Profiles:
+        - "strict": Maximum security, blocks potentially dangerous operations
+        - "balanced": Recommended default, warns about risks but allows execution 
+        - "permissive": Minimal restrictions, full functionality with audit logging
         
-        current_user = getpass.getuser()
-        
-        # Test script to trigger TCC for common applications
-        test_scripts = {
-            "Music": 'tell application "Music" to playpause',
-            "System Events": 'tell application "System Events" to get name of first process',
-            "Finder": 'tell application "Finder" to get name of front window'
-        }
-        
-        results = {}
-        
-        for app_name, script in test_scripts.items():
-            try:
-                result = execute_osascript_safely(script, timeout=5)
-                if result.get('status') == 'success':
-                    results[app_name] = "✅ Granted"
-                elif result.get('type') == 'TCC_PERMISSION_DENIED':
-                    results[app_name] = "❌ Denied"
-                else:
-                    results[app_name] = f"⚠️ Other error: {result.get('type')}"
-            except Exception as e:
-                results[app_name] = f"⚠️ Error: {str(e)}"
-        
-        return {
-            'status': 'diagnostic_complete',
-            'user': current_user,
-            'permissions': results,
-            'fix_instructions': [
-                "1. Open System Settings > Privacy & Security > Automation",
-                "2. Look for your terminal app (Terminal, iTerm2, VS Code, etc.)",
-                "3. Enable checkboxes for the apps you want to control",
-                "4. If no dialog appeared, run: sudo tccutil reset AppleEvents",
-                "5. Try the script again to trigger the permission dialog",
-                "6. Still stuck? Run: sudo killall -9 tccd to refresh TCC cache"
-            ],
-            'reset_commands': [
-                f"sudo tccutil reset AppleEvents",
-                f"sudo tccutil reset All {current_user}",
-                f"sudo killall -9 tccd"
-            ]
-        }
-
-    @server.resource("applescript://example/{script_type}")
-    def get_example_script(script_type: str) -> str:
-        """
-        Get example AppleScript snippets for common tasks.
+        Features:
+        - Complete osascript support for AppleScript and JavaScript
+        - Shell script execution via "do shell script"
+        - Automatic TCC permission dialog handling
+        - Intelligent error recovery and user guidance
+        - Security risk assessment and warnings
+        - Comprehensive execution logging
+        - Dry-run mode for analysis without execution
         
         Args:
-            script_type: Type of example script to retrieve
+            script: The script code to execute or analyze (AppleScript or JavaScript for osascript)
+            execution_timeout: Maximum execution time in seconds (default: 30, ignored in dry_run)
+            security_profile: Security mode ("strict", "balanced", "permissive") 
+            enable_auto_permissions: Automatically handle macOS permission dialogs (default: True)
+            dry_run: If True, only analyze security without executing (default: False)
             
-        Available examples:
-        - browser_url: Get current browser URL
-        - notification: Show system notification
-        - clipboard: Get clipboard content
-        - finder_path: Get current Finder path
-        - music_play: Play/pause Music app
-        - music_info: Get current track info
+        Returns:
+            Standardized response with execution results, security analysis, and guidance
         """
-        examples = {
-            'browser_url': '''
-tell application "Safari"
-    if (count of windows) > 0 then
-        return URL of current tab of front window
-    else
-        return "No Safari windows open"
-    end if
-end tell
-'''.strip(),
-            
-            'notification': '''
-display notification "Hello from AppleScript!" with title "MCP osascript"
-'''.strip(),
-            
-            'clipboard': '''
-return the clipboard
-'''.strip(),
-            
-            'finder_path': '''
-tell application "Finder"
-    if (count of windows) > 0 then
-        return POSIX path of (target of front window as alias)
-    else
-        return "No Finder windows open"
-    end if
-end tell
-'''.strip(),
-            
-            'music_play': '''
-tell application "Music" to playpause
-'''.strip(),
-            
-            'music_info': '''
-tell application "Music"
-    if player state is playing then
-        return (name of current track) & " by " & (artist of current track)
-    else
-        return "No music playing"
-    end if
-end tell
-'''.strip()
-        }
+        # Handle dry_run mode for analysis only
+        if dry_run:
+            logger.info(f"Analyzing AppleScript security with {security_profile} profile")
+            return _perform_security_analysis(script, security_profile)
         
-        return examples.get(script_type, f"Unknown example type: {script_type}")
+        logger.info(f"Executing AppleScript with {security_profile} security profile")
+        
+        # Validate input
+        if not script or not script.strip():
+            return StandardResponse.error(
+                'EMPTY_SCRIPT', 
+                'Script cannot be empty',
+                details={'provided_script': script}
+            )
+        
+        # Execute with timing
+        start_time = datetime.now()
+        try:
+            # Run security analysis and execution
+            result = execute_osascript_with_security(script, execution_timeout, security_profile)
+            
+            # Handle TCC permission errors automatically if enabled
+            if enable_auto_permissions and result.get('status') == 'error':
+                enhanced_result = permission_handler.auto_handle_permissions(result)
+                if enhanced_result != result:
+                    result = enhanced_result
+                    logger.info("Applied automatic TCC permission handling")
+            
+            # Standardize successful responses
+            if result.get('status') == 'success':
+                return StandardResponse.success(
+                    data={
+                        'stdout': result.get('stdout', ''),
+                        'stderr': result.get('stderr', ''),
+                        'execution_time': (datetime.now() - start_time).total_seconds()
+                    },
+                    security=result.get('security', {}),
+                    metadata={
+                        'security_profile': security_profile,
+                        'auto_permissions': enable_auto_permissions,
+                        'script_length': len(script),
+                        'execution_timestamp': start_time.isoformat()
+                    }
+                )
+            
+            # Handle security blocks with helpful guidance
+            elif result.get('type') == 'SECURITY_BLOCK':
+                return StandardResponse.error(
+                    'SECURITY_POLICY_VIOLATION',
+                    f"Script blocked by {security_profile} security policy",
+                    details={
+                        'security_analysis': result.get('security', {}),
+                        'suggestions': [
+                            f"Try using 'balanced' or 'permissive' security profile if this script is trusted",
+                            "Review the security warnings and ensure script safety",
+                            "Consider using dry_run=True to analyze risks first"
+                        ],
+                        'alternative_security_profiles': ['balanced', 'permissive'] if security_profile == 'strict' else ['permissive']
+                    }
+                )
+            
+            # Handle other errors with enhanced information
+            else:
+                error_type = result.get('type', 'EXECUTION_ERROR')
+                error_details = result.get('details', 'Script execution failed')
+                
+                response = StandardResponse.error(error_type, error_details)
+                
+                # Add permission info if available
+                if 'permission_info' in result:
+                    response['permission_guidance'] = result['permission_info']
+                
+                return response
+                
+        except Exception as e:
+            logger.error(f"Unexpected error during script execution: {e}")
+            return StandardResponse.error(
+                'SYSTEM_ERROR',
+                'Unexpected system error during execution',
+                details={
+                    'error_message': str(e),
+                    'execution_time': (datetime.now() - start_time).total_seconds()
+                }
+            )
     
-    @server.prompt("safe_browser_url")
-    def safe_browser_url_prompt() -> str:
+    @server.tool()
+    def get_security_profiles() -> Dict[str, Any]:
         """
-        Prompt for safely getting the current browser URL.
+        Get information about all available security profiles.
         
-        This prompt guides the AI to use a safe, tested AppleScript
-        to retrieve the current browser URL without triggering
-        high-risk security warnings.
+        Returns detailed information about each security profile including their
+        patterns, risk levels, and usage recommendations.
+        
+        Returns:
+            Dictionary with security profile information and current configuration
         """
-        return """
-You are about to execute an AppleScript to get the current browser URL.
-This is a safe operation that only reads information and doesn't
-perform any system modifications.
-
-Here's a safe script you can use:
-
-```applescript
-tell application "Safari"
-    if (count of windows) > 0 then
-        return URL of current tab of front window
-    else
-        return "No Safari windows open"
-    end if
-end tell
-```
-
-You can also adapt this for other browsers by changing "Safari" to:
-- "Google Chrome"
-- "Firefox"
-- "Microsoft Edge"
-
-This script will not trigger security warnings and should execute
-immediately without user confirmation.
-"""
+        try:
+            profiles_info = security_manager.list_profiles()
+            
+            usage_stats = {
+                'total_evaluations': len(security_manager.audit_log),
+                'recent_evaluations': len([
+                    log for log in security_manager.audit_log[-100:]
+                    if datetime.fromisoformat(log['timestamp']) > 
+                       datetime.now() - timedelta(hours=24)
+                ]) if security_manager.audit_log else 0
+            }
+            
+            return StandardResponse.success(
+                data={
+                    'current_default_profile': security_manager.default_profile,
+                    'available_profiles': profiles_info,
+                    'usage_statistics': usage_stats,
+                    'recommendations': {
+                        'strict': 'For maximum security with potentially dangerous scripts',
+                        'balanced': 'Recommended default for most use cases', 
+                        'permissive': 'For trusted scripts requiring full system access'
+                    }
+                },
+                metadata={
+                    'query_timestamp': datetime.now().isoformat(),
+                    'profiles_count': len(profiles_info)
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting security profiles: {e}")
+            return StandardResponse.error(
+                'CONFIGURATION_ERROR',
+                'Failed to retrieve security profiles',
+                details={'error_message': str(e)}
+            )
+    
+    @server.tool()
+    def set_security_profile(security_profile: str) -> Dict[str, Any]:
+        """
+        Set the default security profile for script execution.
+        
+        This sets the default security profile that will be used when no explicit
+        profile is specified in execute_applescript calls.
+        
+        Args:
+            security_profile: Security profile to set as default ("strict", "balanced", "permissive")
+            
+        Returns:
+            Confirmation of the configuration change
+        """
+        try:
+            if security_profile not in security_manager.profiles:
+                return StandardResponse.error(
+                    'INVALID_PROFILE',
+                    f"Unknown security profile: {security_profile}",
+                    details={
+                        'provided_profile': security_profile,
+                        'available_profiles': list(security_manager.profiles.keys())
+                    }
+                )
+            
+            old_profile = security_manager.default_profile
+            security_manager.default_profile = security_profile
+            
+            return StandardResponse.success(
+                data={
+                    'message': f"Default security profile changed from '{old_profile}' to '{security_profile}'",
+                    'previous_profile': old_profile,
+                    'new_profile': security_profile
+                },
+                metadata={
+                    'change_timestamp': datetime.now().isoformat(),
+                    'changed_by': 'user_request'
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error setting default security profile: {e}")
+            return StandardResponse.error(
+                'CONFIGURATION_ERROR',
+                'Failed to set default security profile',
+                details={'error_message': str(e)}
+            )
     
     return server
+
 
 def main():
     """Main entry point for the MCP server."""
@@ -773,6 +965,7 @@ def main():
     except Exception as e:
         logger.error(f"Server error: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
